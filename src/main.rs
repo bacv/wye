@@ -1,65 +1,141 @@
-use nix::sys::stat::Mode;
-use nix::unistd::ForkResult;
-use std::ffi::CString;
-use std::path::Path;
-
+use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::{
-    fcntl::OFlag,
-    unistd::{Pid, dup2_stderr, dup2_stdin, dup2_stdout},
+    libc,
+    pty::{OpenptyResult, Winsize},
+    sys::termios::Termios,
+    unistd::{ForkResult, close, execvp},
+};
+use std::{
+    ffi::CString,
+    fs::File,
+    io::{Read, Write},
+    os::fd::{AsRawFd, OwnedFd},
 };
 
+use nix::unistd::{dup2_stderr, dup2_stdin, dup2_stdout};
+
+const STDIN_TOKEN: Token = Token(0);
+const PTY_TOKEN: Token = Token(1);
+const PIPE_TOKEN: Token = Token(2);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pipe_path_str = "/tmp/rust_shell.pipe";
-    let log_path_str = "/tmp/rust_shell.log";
-    let pipe_path = Path::new(pipe_path_str);
-    let log_path = Path::new(log_path_str);
-
-    if pipe_path.exists() {
-        std::fs::remove_file(pipe_path)?;
-    }
-
-    let mode = Mode::S_IRWXU;
-    nix::unistd::mkfifo(pipe_path, mode)?;
+    let t: Termios = unsafe { std::mem::zeroed() };
+    let OpenptyResult {
+        master: master_fd,
+        slave: slave_fd,
+    } = nix::pty::openpty(
+        Some(&Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        Some(&t),
+    )?;
 
     match unsafe { nix::unistd::fork() } {
-        Ok(ForkResult::Parent { child }) => {
-            parent_process(child, pipe_path, log_path);
-            Ok(())
-        }
-        Ok(ForkResult::Child) => child_process(pipe_path, log_path),
+        Ok(ForkResult::Parent { .. }) => parent_process(master_fd),
+        Ok(ForkResult::Child) => child_process(slave_fd),
         Err(e) => {
-            let _ = std::fs::remove_file(pipe_path);
             std::process::exit(e as i32);
         }
     }
 }
 
-pub fn child_process(in_file: &Path, out_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn child_process(slave_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     nix::unistd::setsid()?;
 
-    let in_fd = nix::fcntl::open(in_file, OFlag::O_RDONLY, Mode::empty())?;
+    dup2_stdin(&slave_fd)?;
+    dup2_stdout(&slave_fd)?;
+    dup2_stderr(&slave_fd)?;
 
-    dup2_stdin(&in_fd)?;
-    nix::unistd::close(in_fd)?;
-
-    let out_flags = OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC;
-    let out_mode = Mode::S_IRUSR | Mode::S_IWUSR; // Read/Write for user
-    let out_fd = nix::fcntl::open(out_file, out_flags, out_mode)?;
-
-    dup2_stdout(&out_fd)?;
-    dup2_stderr(&out_fd)?;
-    nix::unistd::close(out_fd)?;
+    close(slave_fd)?;
 
     let shell_path = CString::new("/bin/sh").unwrap();
     let shell_args = [shell_path.clone()];
-    let Err(e) = nix::unistd::execvp(&shell_path, &shell_args);
+    let Err(e) = execvp(&shell_path, &shell_args);
     std::process::exit(e as i32);
 }
 
-pub fn parent_process(child_pid: Pid, in_file: &Path, out_file: &Path) {
-    println!("input file: {}", in_file.to_string_lossy());
-    println!("output file: {}", out_file.to_string_lossy());
-    println!("to \"kill {}\"", child_pid);
+pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
 
-    std::process::exit(0);
+    let stdin_fd = libc::STDIN_FILENO;
+
+    let binding = master_fd.as_raw_fd();
+    let mut master_file = File::from(master_fd);
+    let mut master_fd_source = SourceFd(&binding);
+    let mut stdin_source = SourceFd(&stdin_fd);
+
+    let pipe_path = "/tmp/wye.pipe";
+    if std::path::Path::new(pipe_path).exists() {
+        std::fs::remove_file(pipe_path)?;
+    }
+    nix::unistd::mkfifo(pipe_path, nix::sys::stat::Mode::S_IRWXU)?;
+    use nix::fcntl::{OFlag, open};
+    let pipe_fd = open(
+        pipe_path,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let binding = pipe_fd.as_raw_fd();
+    let mut pipe_source = SourceFd(&binding);
+    let mut pipe_buf = [0u8; 1024];
+
+    poll.registry()
+        .register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
+    poll.registry()
+        .register(&mut master_fd_source, PTY_TOKEN, Interest::READABLE)?;
+    poll.registry()
+        .register(&mut pipe_source, PIPE_TOKEN, Interest::READABLE)?;
+
+    let mut stdin_buf = [0u8; 1024];
+    let mut pty_buf = [0u8; 1024];
+
+    let stdout = std::io::stdout();
+    let mut stdout_lock = stdout.lock();
+
+    loop {
+        poll.poll(&mut events, None)?;
+
+        for event in events.iter() {
+            match event.token() {
+                STDIN_TOKEN => {
+                    let n = unsafe {
+                        libc::read(stdin_fd, stdin_buf.as_mut_ptr() as *mut _, stdin_buf.len())
+                    };
+
+                    #[allow(clippy::comparison_chain)]
+                    if n > 0 {
+                        master_file.write_all(&stdin_buf[..n as usize])?;
+                    } else if n == 0 {
+                        return Ok(());
+                    }
+                }
+                PTY_TOKEN => {
+                    let n = master_file.read(&mut pty_buf)?;
+                    if n > 0 {
+                        stdout_lock.write_all(&pty_buf[..n])?;
+                        stdout_lock.flush()?;
+                    } else {
+                        return Ok(());
+                    }
+                }
+                PIPE_TOKEN => {
+                    let n = unsafe {
+                        libc::read(
+                            pipe_fd.as_raw_fd(),
+                            pipe_buf.as_mut_ptr() as *mut _,
+                            pipe_buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        master_file.write_all(&pipe_buf[..n as usize])?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }

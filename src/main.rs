@@ -1,7 +1,7 @@
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::{
-    libc,
-    pty::{OpenptyResult, Winsize},
+    libc::{self, TIOCGWINSZ, TIOCSWINSZ},
+    pty::{Winsize, openpty},
     sys::termios::Termios,
     unistd::{ForkResult, close, execvp},
 };
@@ -18,24 +18,17 @@ const STDIN_TOKEN: Token = Token(0);
 const PTY_TOKEN: Token = Token(1);
 const PIPE_TOKEN: Token = Token(2);
 
+nix::ioctl_read_bad!(tiocgwinsz, TIOCGWINSZ, Winsize);
+nix::ioctl_write_ptr_bad!(tiocswinsz, TIOCSWINSZ, Winsize);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let t: Termios = unsafe { std::mem::zeroed() };
-    let OpenptyResult {
-        master: master_fd,
-        slave: slave_fd,
-    } = nix::pty::openpty(
-        Some(&Winsize {
-            ws_row: 24,
-            ws_col: 80,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        }),
-        Some(&t),
-    )?;
+    let initial_winsize = get_winsize()?;
+    let termios_settings: Termios = unsafe { std::mem::zeroed() };
+    let pty = openpty(Some(&initial_winsize), Some(&termios_settings))?;
 
     match unsafe { nix::unistd::fork() } {
-        Ok(ForkResult::Parent { .. }) => parent_process(master_fd),
-        Ok(ForkResult::Child) => child_process(slave_fd),
+        Ok(ForkResult::Parent { .. }) => parent_process(pty.master),
+        Ok(ForkResult::Child) => child_process(pty.slave),
         Err(e) => {
             std::process::exit(e as i32);
         }
@@ -105,11 +98,9 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
                     let n = unsafe {
                         libc::read(stdin_fd, stdin_buf.as_mut_ptr() as *mut _, stdin_buf.len())
                     };
-
-                    #[allow(clippy::comparison_chain)]
                     if n > 0 {
                         master_file.write_all(&stdin_buf[..n as usize])?;
-                    } else if n == 0 {
+                    } else {
                         return Ok(());
                     }
                 }
@@ -138,4 +129,18 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
             }
         }
     }
+}
+
+fn get_winsize() -> Result<Winsize, Box<dyn std::error::Error>> {
+    let mut winsize = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    unsafe {
+        tiocgwinsz(libc::STDOUT_FILENO, &mut winsize)?;
+    }
+    Ok(winsize)
 }

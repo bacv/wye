@@ -20,7 +20,7 @@ const PTY_TOKEN: Token = Token(1);
 const PIPE_TOKEN: Token = Token(2);
 const SIGNAL_TOKEN: Token = Token(3);
 
-static mut SIGNAL_PIPE: RawFd = -1;
+static mut SIGNAL_OUT: RawFd = -1;
 
 nix::ioctl_read_bad!(tiocgwinsz, TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(tiocswinsz, TIOCSWINSZ, Winsize);
@@ -40,21 +40,16 @@ fn get_winsize() -> Result<Winsize, Box<dyn std::error::Error>> {
     Ok(winsize)
 }
 
-fn update_pty_size(
-    pty_master_fd: &impl AsRawFd,
-    new_size: &Winsize,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn update_pty_size(fd: &impl AsRawFd, size: &Winsize) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-        tiocswinsz(pty_master_fd.as_raw_fd(), new_size)?;
+        tiocswinsz(fd.as_raw_fd(), size)?;
     }
     Ok(())
 }
 
 extern "C" fn handle_sigwinch(_: libc::c_int) {
-    unsafe {
-        let signal_fd = BorrowedFd::borrow_raw(SIGNAL_PIPE);
-        let _ = nix::unistd::write(signal_fd, &[0u8]);
-    }
+    let signal_fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_OUT) };
+    let _ = nix::unistd::write(signal_fd, &[0u8]);
 }
 
 pub fn child_process(slave_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
@@ -79,12 +74,12 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
 
-    let stdin_fd = libc::STDIN_FILENO;
-
-    let master_binding = master_fd.as_raw_fd();
+    let master_raw = master_fd.as_raw_fd();
     let mut master_file = File::from(master_fd);
-    let mut master_fd_source = SourceFd(&master_binding);
-    let mut stdin_source = SourceFd(&stdin_fd);
+    let mut master_source = SourceFd(&master_raw);
+
+    let stdin_raw = libc::STDIN_FILENO;
+    let mut stdin_source = SourceFd(&stdin_raw);
 
     let pipe_path = "/tmp/wye.pipe";
     if std::path::Path::new(pipe_path).exists() {
@@ -96,14 +91,14 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
         OFlag::O_RDONLY | OFlag::O_NONBLOCK,
         nix::sys::stat::Mode::empty(),
     )?;
-    let pipe_binding = pipe_fd.as_raw_fd();
-    let mut pipe_source = SourceFd(&pipe_binding);
+    let pipe_raw = pipe_fd.as_raw_fd();
+    let mut pipe_source = SourceFd(&pipe_raw);
     let mut pipe_buf = [0u8; 1024];
 
-    let signal_pipe = nix::unistd::pipe()?;
-    unsafe { SIGNAL_PIPE = signal_pipe.1.as_raw_fd() };
-    let signal_binding = signal_pipe.0.as_raw_fd();
-    nix::fcntl::fcntl(&signal_pipe.0, nix::fcntl::F_SETFL(OFlag::O_NONBLOCK))?;
+    let (signal_in, signal_out) = nix::unistd::pipe()?;
+    unsafe { SIGNAL_OUT = signal_out.as_raw_fd() };
+    let signal_binding = signal_in.as_raw_fd();
+    nix::fcntl::fcntl(&signal_in, nix::fcntl::F_SETFL(OFlag::O_NONBLOCK))?;
     let sig_action = SigAction::new(
         SigHandler::Handler(handle_sigwinch),
         SaFlags::empty(),
@@ -111,12 +106,13 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
     );
 
     unsafe { nix::sys::signal::sigaction(nix::sys::signal::SIGWINCH, &sig_action)? };
+    let mut signal_file = File::from(signal_in);
     let mut signal_source = SourceFd(&signal_binding);
 
     poll.registry()
         .register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
     poll.registry()
-        .register(&mut master_fd_source, PTY_TOKEN, Interest::READABLE)?;
+        .register(&mut master_source, PTY_TOKEN, Interest::READABLE)?;
     poll.registry()
         .register(&mut pipe_source, PIPE_TOKEN, Interest::READABLE)?;
     poll.registry()
@@ -142,9 +138,7 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
         for event in events.iter() {
             match event.token() {
                 STDIN_TOKEN => {
-                    let n = unsafe {
-                        libc::read(stdin_fd, stdin_buf.as_mut_ptr() as *mut _, stdin_buf.len())
-                    };
+                    let n = std::io::stdin().read(&mut stdin_buf)?;
                     match n.cmp(&0) {
                         std::cmp::Ordering::Greater => {
                             master_file.write_all(&stdin_buf[..n as usize])?;
@@ -173,14 +167,11 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
                     }
                 }
                 SIGNAL_TOKEN => {
-                    let mut drain = [0u8; 32];
-                    let signal_fd = unsafe { BorrowedFd::borrow_raw(signal_binding) };
-                    while nix::unistd::read(signal_fd, &mut drain).is_ok() {
-                        // Keep reading until it's empty.
-                    }
+                    let mut drain_buf = [0; 1];
+                    _ = signal_file.read(&mut drain_buf);
 
                     if let Ok(new_size) = get_winsize() {
-                        let _ = update_pty_size(&master_binding, &new_size);
+                        let _ = update_pty_size(&master_raw, &new_size);
                     }
                 }
                 _ => {}
@@ -201,8 +192,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     termios::tcsetattr(std::io::stdin(), SetArg::TCSANOW, &termios_settings)?;
 
     match unsafe { nix::unistd::fork() } {
-        Ok(ForkResult::Parent { .. }) => parent_process(pty.master),
-        Ok(ForkResult::Child) => child_process(pty.slave),
+        Ok(ForkResult::Parent { .. }) => {
+            close(pty.slave)?;
+            parent_process(pty.master)
+        }
+        Ok(ForkResult::Child) => {
+            close(pty.master)?;
+            child_process(pty.slave)
+        }
         Err(e) => {
             std::process::exit(e as i32);
         }

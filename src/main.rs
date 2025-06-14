@@ -1,13 +1,11 @@
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::libc;
+use nix::sys::termios::{self, LocalFlags, SetArg, tcgetattr};
 use nix::{
     fcntl::{OFlag, open},
     libc::{TIOCGWINSZ, TIOCSWINSZ},
     pty::{Winsize, openpty},
-    sys::{
-        signal::{SaFlags, SigAction, SigHandler, SigSet},
-        termios::Termios,
-    },
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet},
     unistd::{ForkResult, close, dup2_stderr, dup2_stdin, dup2_stdout, execvp},
 };
 use std::{
@@ -26,6 +24,7 @@ static mut SIGNAL_PIPE: RawFd = -1;
 
 nix::ioctl_read_bad!(tiocgwinsz, TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(tiocswinsz, TIOCSWINSZ, Winsize);
+nix::ioctl_none_bad!(tiocsctty, libc::TIOCSCTTY);
 
 fn get_winsize() -> Result<Winsize, Box<dyn std::error::Error>> {
     let mut winsize = Winsize {
@@ -60,6 +59,9 @@ extern "C" fn handle_sigwinch(_: libc::c_int) {
 
 pub fn child_process(slave_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     nix::unistd::setsid()?;
+    unsafe {
+        tiocsctty(slave_fd.as_raw_fd())?;
+    }
 
     dup2_stdin(&slave_fd)?;
     dup2_stdout(&slave_fd)?;
@@ -189,8 +191,14 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_winsize = get_winsize()?;
-    let termios_settings: Termios = unsafe { std::mem::zeroed() };
+    let mut termios_settings = tcgetattr(std::io::stdin())?;
+
     let pty = openpty(Some(&initial_winsize), Some(&termios_settings))?;
+
+    termios_settings
+        .local_flags
+        .remove(LocalFlags::ICANON | LocalFlags::ECHO);
+    termios::tcsetattr(std::io::stdin(), SetArg::TCSANOW, &termios_settings)?;
 
     match unsafe { nix::unistd::fork() } {
         Ok(ForkResult::Parent { .. }) => parent_process(pty.master),

@@ -8,6 +8,7 @@ use nix::{
     sys::signal::{SaFlags, SigAction, SigHandler, SigSet},
     unistd::{ForkResult, close, dup2_stderr, dup2_stdin, dup2_stdout, execvp},
 };
+use std::io::Stdin;
 use std::{
     ffi::CString,
     fs::File,
@@ -52,7 +53,7 @@ extern "C" fn handle_sigwinch(_: libc::c_int) {
     let _ = nix::unistd::write(signal_fd, &[0u8]);
 }
 
-pub fn child_process(slave_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+fn child_process(slave_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     nix::unistd::setsid()?;
     unsafe {
         tiocsctty(slave_fd.as_raw_fd())?;
@@ -70,56 +71,76 @@ pub fn child_process(slave_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>
     std::process::exit(e as i32);
 }
 
-pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(128);
-
-    let master_raw = master_fd.as_raw_fd();
-    let mut master_file = File::from(master_fd);
-    let mut master_source = SourceFd(&master_raw);
-
-    let stdin_raw = libc::STDIN_FILENO;
-    let mut stdin_source = SourceFd(&stdin_raw);
-
-    let pipe_path = "/tmp/wye.pipe";
-    if std::path::Path::new(pipe_path).exists() {
-        std::fs::remove_file(pipe_path)?;
+fn prepare_pipe(path: &str) -> std::io::Result<OwnedFd> {
+    if std::path::Path::new(path).exists() {
+        std::fs::remove_file(path)?;
     }
-    nix::unistd::mkfifo(pipe_path, nix::sys::stat::Mode::S_IRWXU)?;
+    nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU)?;
     let pipe_fd = open(
-        pipe_path,
+        path,
         OFlag::O_RDONLY | OFlag::O_NONBLOCK,
         nix::sys::stat::Mode::empty(),
     )?;
+    Ok(pipe_fd)
+}
+
+fn setup_master(poll: &mut Poll, master_fd: OwnedFd) -> std::io::Result<File> {
+    let master_raw = master_fd.as_raw_fd();
+    let mut master_source = SourceFd(&master_raw);
+    poll.registry()
+        .register(&mut master_source, PTY_TOKEN, Interest::READABLE)?;
+    Ok(File::from(master_fd))
+}
+
+fn setup_stdin(poll: &mut Poll) -> std::io::Result<Stdin> {
+    let mut stdin_source = SourceFd(&libc::STDIN_FILENO);
+    poll.registry()
+        .register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
+    Ok(std::io::stdin())
+}
+
+fn setup_pipe(poll: &mut Poll, pipe_fd: OwnedFd) -> std::io::Result<File> {
     let pipe_raw = pipe_fd.as_raw_fd();
     let mut pipe_source = SourceFd(&pipe_raw);
-    let mut pipe_buf = [0u8; 1024];
+    poll.registry()
+        .register(&mut pipe_source, PIPE_TOKEN, Interest::READABLE)?;
+    Ok(File::from(pipe_fd))
+}
 
-    let (signal_in, signal_out) = nix::unistd::pipe()?;
-    unsafe { SIGNAL_OUT = signal_out.as_raw_fd() };
-    let signal_binding = signal_in.as_raw_fd();
-    nix::fcntl::fcntl(&signal_in, nix::fcntl::F_SETFL(OFlag::O_NONBLOCK))?;
+fn setup_signal(poll: &mut Poll, signal_in: OwnedFd) -> std::io::Result<File> {
     let sig_action = SigAction::new(
         SigHandler::Handler(handle_sigwinch),
         SaFlags::empty(),
         SigSet::empty(),
     );
-
     unsafe { nix::sys::signal::sigaction(nix::sys::signal::SIGWINCH, &sig_action)? };
-    let mut signal_file = File::from(signal_in);
-    let mut signal_source = SourceFd(&signal_binding);
+    nix::fcntl::fcntl(&signal_in, nix::fcntl::F_SETFL(OFlag::O_NONBLOCK))?;
 
-    poll.registry()
-        .register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
-    poll.registry()
-        .register(&mut master_source, PTY_TOKEN, Interest::READABLE)?;
-    poll.registry()
-        .register(&mut pipe_source, PIPE_TOKEN, Interest::READABLE)?;
+    let signal_fd = signal_in.as_raw_fd();
+    let mut signal_source = SourceFd(&signal_fd);
     poll.registry()
         .register(&mut signal_source, SIGNAL_TOKEN, Interest::READABLE)?;
+    Ok(File::from(signal_in))
+}
+
+fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
+
+    let mut master_file = setup_master(&mut poll, master_fd)?;
+    let mut stdin = setup_stdin(&mut poll)?;
+
+    let pipe_path = "/tmp/wye.pipe";
+    let pipe_fd = prepare_pipe(pipe_path)?;
+    let mut pipe_file = setup_pipe(&mut poll, pipe_fd)?;
+
+    let (signal_in, signal_out) = nix::unistd::pipe()?;
+    unsafe { SIGNAL_OUT = signal_out.as_raw_fd() };
+    let mut signal_file = setup_signal(&mut poll, signal_in)?;
 
     let mut stdin_buf = [0u8; 1024];
     let mut pty_buf = [0u8; 1024];
+    let mut pipe_buf = [0u8; 1024];
 
     let stdout = std::io::stdout();
     let mut stdout_lock = stdout.lock();
@@ -138,7 +159,7 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
         for event in events.iter() {
             match event.token() {
                 STDIN_TOKEN => {
-                    let n = std::io::stdin().read(&mut stdin_buf)?;
+                    let n = stdin.read(&mut stdin_buf)?;
                     match n.cmp(&0) {
                         std::cmp::Ordering::Greater => {
                             master_file.write_all(&stdin_buf[..n as usize])?;
@@ -161,7 +182,7 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
                     }
                 }
                 PIPE_TOKEN => {
-                    let n = nix::unistd::read(&pipe_fd, &mut pipe_buf)?;
+                    let n = pipe_file.read(&mut pipe_buf)?;
                     if n > 0 {
                         master_file.write_all(&pipe_buf[..n as usize])?;
                     }
@@ -171,7 +192,7 @@ pub fn parent_process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Erro
                     _ = signal_file.read(&mut drain_buf);
 
                     if let Ok(new_size) = get_winsize() {
-                        let _ = update_pty_size(&master_raw, &new_size);
+                        let _ = update_pty_size(&master_file, &new_size);
                     }
                 }
                 _ => {}

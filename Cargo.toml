@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 mio = { version = "1", features = ["os-ext", "os-poll"] }
-nix = { version = "0.30", features = ["fs", "ioctl", "process", "signal", "term"] }
+nix = { version = "0.30.1", features = ["fs", "ioctl", "process", "signal", "term"] }
 
 [profile.release]
 opt-level = "z"

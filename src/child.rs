@@ -6,9 +6,9 @@ use std::{
 
 use nix::unistd::{close, dup2_stderr, dup2_stdin, dup2_stdout, execvp};
 
-use crate::term::tiocsctty;
+use crate::{config::Config, term::tiocsctty};
 
-pub fn process(slave_fd: OwnedFd) -> Result<(), Box<dyn error::Error>> {
+pub fn process(_config: &Config, slave_fd: OwnedFd) -> Result<(), Box<dyn error::Error>> {
     nix::unistd::setsid()?;
     unsafe {
         tiocsctty(slave_fd.as_raw_fd())?;

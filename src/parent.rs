@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     fs::File,
     io::{self, Read, Write},
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
 };
 
@@ -15,13 +15,15 @@ use nix::{
 };
 
 use crate::{
-    PIPE_TOKEN, PTY_TOKEN, SIGNAL_OUT, SIGNAL_TOKEN, STDIN_TOKEN,
+    PIPE_TOKEN, PTY_TOKEN, RESIZE_OUT, RESIZE_TOKEN, STDIN_TOKEN, WYE_PIPE_DIR, WYE_PIPE_PREFIX,
+    config::Config,
     term::{get_winsize, update_pty_size},
 };
 
 extern "C" fn handle_sigwinch(_: c_int) {
-    let signal_fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_OUT) };
-    let _ = nix::unistd::write(signal_fd, &[0u8]);
+    if let Some(fd) = RESIZE_OUT.get() {
+        let _ = nix::unistd::write(fd, &[0u8]);
+    }
 }
 
 fn prepare_pipe(path: &str) -> io::Result<OwnedFd> {
@@ -56,7 +58,7 @@ fn setup_pipe(poll: &mut Poll, pipe_fd: OwnedFd) -> io::Result<File> {
     Ok(File::from(pipe_fd))
 }
 
-fn setup_signal(poll: &mut Poll, signal_in: OwnedFd) -> io::Result<File> {
+fn setup_resize(poll: &mut Poll, signal_in: OwnedFd) -> io::Result<File> {
     let sig_action = signal::SigAction::new(
         signal::SigHandler::Handler(handle_sigwinch),
         signal::SaFlags::empty(),
@@ -68,7 +70,7 @@ fn setup_signal(poll: &mut Poll, signal_in: OwnedFd) -> io::Result<File> {
     let signal_fd = signal_in.as_raw_fd();
     let mut signal_source = SourceFd(&signal_fd);
     poll.registry()
-        .register(&mut signal_source, SIGNAL_TOKEN, Interest::READABLE)?;
+        .register(&mut signal_source, RESIZE_TOKEN, Interest::READABLE)?;
     Ok(File::from(signal_in))
 }
 
@@ -77,7 +79,7 @@ fn event_loop(
     stdin: &mut io::Stdin,
     master_file: &mut File,
     pipe_file: &mut File,
-    signal_file: &mut File,
+    resize_file: &mut File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin_buf = [0u8; 1024];
     let mut pty_buf = [0u8; 1024];
@@ -130,9 +132,9 @@ fn event_loop(
                         master_file.write_all(&pipe_buf[..n])?;
                     }
                 }
-                SIGNAL_TOKEN => {
+                RESIZE_TOKEN => {
                     let mut drain_buf = [0; 1];
-                    _ = signal_file.read(&mut drain_buf);
+                    _ = resize_file.read(&mut drain_buf);
 
                     if let Ok(new_size) = get_winsize() {
                         let _ = update_pty_size(master_file, &new_size);
@@ -144,25 +146,30 @@ fn event_loop(
     }
 }
 
-pub fn process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+pub fn process(config: &Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     let mut poll = Poll::new()?;
 
     let mut master_file = setup_master(&mut poll, master_fd)?;
     let mut stdin = setup_stdin(&mut poll)?;
 
-    let pipe_path = "/tmp/wye.pipe";
-    let pipe_fd = prepare_pipe(pipe_path)?;
+    let pipe_path = format!("{WYE_PIPE_DIR}/{WYE_PIPE_PREFIX}-{}", config.session_number);
+    println!("{pipe_path}");
+    let pipe_fd = prepare_pipe(&pipe_path)?;
     let mut pipe_file = setup_pipe(&mut poll, pipe_fd)?;
 
-    let (signal_in, signal_out) = nix::unistd::pipe()?;
-    unsafe { SIGNAL_OUT = signal_out.as_raw_fd() };
-    let mut signal_file = setup_signal(&mut poll, signal_in)?;
+    let (resize_in, resize_out) = nix::unistd::pipe()?;
+    RESIZE_OUT.get_or_init(|| resize_out);
+    let mut resize_file = setup_resize(&mut poll, resize_in)?;
 
-    event_loop(
+    let res = event_loop(
         &mut poll,
         &mut stdin,
         &mut master_file,
         &mut pipe_file,
-        &mut signal_file,
-    )
+        &mut resize_file,
+    );
+
+    std::fs::remove_file(pipe_path)?;
+
+    res
 }

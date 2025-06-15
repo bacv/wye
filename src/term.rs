@@ -1,4 +1,7 @@
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::{
+    error,
+    os::fd::{AsRawFd, BorrowedFd, RawFd},
+};
 
 use nix::{
     libc::{STDOUT_FILENO, TIOCGWINSZ, TIOCSCTTY, TIOCSWINSZ},
@@ -10,7 +13,7 @@ nix::ioctl_read_bad!(tiocgwinsz, TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(tiocswinsz, TIOCSWINSZ, Winsize);
 nix::ioctl_none_bad!(tiocsctty, TIOCSCTTY);
 
-pub fn get_winsize() -> Result<Winsize, Box<dyn std::error::Error>> {
+pub fn get_winsize() -> Result<Winsize, Box<dyn error::Error>> {
     let mut winsize = Winsize {
         ws_row: 24,
         ws_col: 80,
@@ -24,10 +27,7 @@ pub fn get_winsize() -> Result<Winsize, Box<dyn std::error::Error>> {
     Ok(winsize)
 }
 
-pub fn update_pty_size(
-    fd: &impl AsRawFd,
-    size: &Winsize,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn update_pty_size(fd: &impl AsRawFd, size: &Winsize) -> Result<(), Box<dyn error::Error>> {
     unsafe {
         tiocswinsz(fd.as_raw_fd(), size)?;
     }

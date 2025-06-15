@@ -1,6 +1,6 @@
 use std::os::fd::AsRawFd;
 
-use nix::sys::termios::{self, LocalFlags, SetArg, tcgetattr};
+use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use nix::{
     pty::openpty,
     unistd::{ForkResult, close},
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     termios_settings
         .local_flags
         .remove(LocalFlags::ICANON | LocalFlags::ECHO);
-    termios::tcsetattr(std::io::stdin(), SetArg::TCSANOW, &termios_settings)?;
+    tcsetattr(std::io::stdin(), SetArg::TCSANOW, &termios_settings)?;
 
     match unsafe { nix::unistd::fork() } {
         Ok(ForkResult::Parent { .. }) => {

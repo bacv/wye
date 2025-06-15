@@ -1,35 +1,39 @@
 use std::{
+    cmp::Ordering,
     fs::File,
-    io::{Read, Stdin, Write},
-    os::fd::{AsRawFd, OwnedFd},
+    io::{self, Read, Write},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    path::Path,
 };
 
 use mio::{Events, Interest, Poll, unix::SourceFd};
 use nix::{
-    fcntl::{OFlag, open},
-    libc::STDIN_FILENO,
-    sys::signal::{SaFlags, SigAction, SigHandler, SigSet},
+    fcntl::{F_SETFL, OFlag, fcntl, open},
+    libc::{STDIN_FILENO, c_int},
+    sys::{signal, stat::Mode},
+    unistd::mkfifo,
 };
 
 use crate::{
-    PIPE_TOKEN, PTY_TOKEN, SIGNAL_OUT, SIGNAL_TOKEN, STDIN_TOKEN, handle_sigwinch,
+    PIPE_TOKEN, PTY_TOKEN, SIGNAL_OUT, SIGNAL_TOKEN, STDIN_TOKEN,
     term::{get_winsize, update_pty_size},
 };
 
-fn prepare_pipe(path: &str) -> std::io::Result<OwnedFd> {
-    if std::path::Path::new(path).exists() {
+extern "C" fn handle_sigwinch(_: c_int) {
+    let signal_fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_OUT) };
+    let _ = nix::unistd::write(signal_fd, &[0u8]);
+}
+
+fn prepare_pipe(path: &str) -> io::Result<OwnedFd> {
+    if Path::new(path).exists() {
         std::fs::remove_file(path)?;
     }
-    nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU)?;
-    let pipe_fd = open(
-        path,
-        OFlag::O_RDONLY | OFlag::O_NONBLOCK,
-        nix::sys::stat::Mode::empty(),
-    )?;
+    mkfifo(path, Mode::S_IRWXU)?;
+    let pipe_fd = open(path, OFlag::O_RDONLY | OFlag::O_NONBLOCK, Mode::empty())?;
     Ok(pipe_fd)
 }
 
-fn setup_master(poll: &mut Poll, master_fd: OwnedFd) -> std::io::Result<File> {
+fn setup_master(poll: &mut Poll, master_fd: OwnedFd) -> io::Result<File> {
     let master_raw = master_fd.as_raw_fd();
     let mut master_source = SourceFd(&master_raw);
     poll.registry()
@@ -37,14 +41,14 @@ fn setup_master(poll: &mut Poll, master_fd: OwnedFd) -> std::io::Result<File> {
     Ok(File::from(master_fd))
 }
 
-fn setup_stdin(poll: &mut Poll) -> std::io::Result<Stdin> {
+fn setup_stdin(poll: &mut Poll) -> io::Result<io::Stdin> {
     let mut stdin_source = SourceFd(&STDIN_FILENO);
     poll.registry()
         .register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
-    Ok(std::io::stdin())
+    Ok(io::stdin())
 }
 
-fn setup_pipe(poll: &mut Poll, pipe_fd: OwnedFd) -> std::io::Result<File> {
+fn setup_pipe(poll: &mut Poll, pipe_fd: OwnedFd) -> io::Result<File> {
     let pipe_raw = pipe_fd.as_raw_fd();
     let mut pipe_source = SourceFd(&pipe_raw);
     poll.registry()
@@ -52,14 +56,14 @@ fn setup_pipe(poll: &mut Poll, pipe_fd: OwnedFd) -> std::io::Result<File> {
     Ok(File::from(pipe_fd))
 }
 
-fn setup_signal(poll: &mut Poll, signal_in: OwnedFd) -> std::io::Result<File> {
-    let sig_action = SigAction::new(
-        SigHandler::Handler(handle_sigwinch),
-        SaFlags::empty(),
-        SigSet::empty(),
+fn setup_signal(poll: &mut Poll, signal_in: OwnedFd) -> io::Result<File> {
+    let sig_action = signal::SigAction::new(
+        signal::SigHandler::Handler(handle_sigwinch),
+        signal::SaFlags::empty(),
+        signal::SigSet::empty(),
     );
-    unsafe { nix::sys::signal::sigaction(nix::sys::signal::SIGWINCH, &sig_action)? };
-    nix::fcntl::fcntl(&signal_in, nix::fcntl::F_SETFL(OFlag::O_NONBLOCK))?;
+    unsafe { signal::sigaction(signal::Signal::SIGWINCH, &sig_action)? };
+    fcntl(&signal_in, F_SETFL(OFlag::O_NONBLOCK))?;
 
     let signal_fd = signal_in.as_raw_fd();
     let mut signal_source = SourceFd(&signal_fd);
@@ -68,9 +72,9 @@ fn setup_signal(poll: &mut Poll, signal_in: OwnedFd) -> std::io::Result<File> {
     Ok(File::from(signal_in))
 }
 
-fn merge_loop(
+fn event_loop(
     poll: &mut Poll,
-    stdin: &mut Stdin,
+    stdin: &mut io::Stdin,
     master_file: &mut File,
     pipe_file: &mut File,
     signal_file: &mut File,
@@ -79,7 +83,7 @@ fn merge_loop(
     let mut pty_buf = [0u8; 1024];
     let mut pipe_buf = [0u8; 1024];
 
-    let stdout = std::io::stdout();
+    let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
 
     let mut events = Events::with_capacity(128);
@@ -87,7 +91,7 @@ fn merge_loop(
     loop {
         match poll.poll(&mut events, None) {
             Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
                 continue;
             }
             Err(e) => {
@@ -100,14 +104,14 @@ fn merge_loop(
                 STDIN_TOKEN => {
                     let n = stdin.read(&mut stdin_buf)?;
                     match n.cmp(&0) {
-                        std::cmp::Ordering::Greater => {
+                        Ordering::Greater => {
                             master_file.write_all(&stdin_buf[..n])?;
                         }
-                        std::cmp::Ordering::Equal => {
+                        Ordering::Equal => {
                             return Ok(());
                         }
-                        std::cmp::Ordering::Less => {
-                            return Err(std::io::Error::last_os_error().into());
+                        Ordering::Less => {
+                            return Err(io::Error::last_os_error().into());
                         }
                     }
                 }
@@ -154,7 +158,7 @@ pub fn process(master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     unsafe { SIGNAL_OUT = signal_out.as_raw_fd() };
     let mut signal_file = setup_signal(&mut poll, signal_in)?;
 
-    merge_loop(
+    event_loop(
         &mut poll,
         &mut stdin,
         &mut master_file,

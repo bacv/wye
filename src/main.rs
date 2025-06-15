@@ -3,7 +3,8 @@ use nix::{
     pty::openpty,
     unistd::{ForkResult, close},
 };
-use wye::{child_process, get_winsize, parent_process};
+use wye::term::get_winsize;
+use wye::{child, parent};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_winsize = get_winsize()?;
@@ -19,11 +20,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match unsafe { nix::unistd::fork() } {
         Ok(ForkResult::Parent { .. }) => {
             close(pty.slave)?;
-            parent_process(pty.master)
+            parent::process(pty.master)
         }
         Ok(ForkResult::Child) => {
             close(pty.master)?;
-            child_process(pty.slave)
+            child::process(pty.slave)
         }
         Err(e) => {
             std::process::exit(e as i32);

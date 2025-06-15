@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 use nix::{
     libc::{STDOUT_FILENO, TIOCGWINSZ, TIOCSCTTY, TIOCSWINSZ},
@@ -34,20 +34,24 @@ pub fn update_pty_size(
     Ok(())
 }
 
-struct TerminalModeGuard {
+pub struct TerminalModeGuard {
     original: Termios,
-    fd: OwnedFd,
+    fd: RawFd,
 }
 
 impl TerminalModeGuard {
-    fn new(fd: OwnedFd) -> nix::Result<Self> {
-        let original = tcgetattr(&fd)?;
+    pub fn new(fd: RawFd) -> nix::Result<Self> {
+        let original = tcgetattr(unsafe { BorrowedFd::borrow_raw(fd) })?;
         Ok(Self { original, fd })
     }
 }
 
 impl Drop for TerminalModeGuard {
     fn drop(&mut self) {
-        let _ = tcsetattr(&self.fd, SetArg::TCSANOW, &self.original);
+        let _ = tcsetattr(
+            unsafe { BorrowedFd::borrow_raw(self.fd) },
+            SetArg::TCSANOW,
+            &self.original,
+        );
     }
 }

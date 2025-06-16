@@ -57,3 +57,11 @@ cargo build --release
 ```
 
 The final program will be located at `target/release/wye`.
+
+## Installing from Source
+
+```sh
+cargo install .
+```
+
+Open new terminal window and run `wye`.

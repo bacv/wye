@@ -61,7 +61,7 @@ The final program will be located at `target/release/wye`.
 ## Installing from Source
 
 ```sh
-cargo install .
+cargo install --path .
 ```
 
 Open new terminal window and run `wye`.

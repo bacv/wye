@@ -153,7 +153,6 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
     let mut stdin = setup_stdin(&mut poll)?;
 
     let pipe_path = format!("{WYE_PIPE_DIR}/{WYE_PIPE_PREFIX}-{}", config.session_number);
-    println!("{pipe_path}");
     let pipe_fd = prepare_pipe(&pipe_path)?;
     let mut pipe_file = setup_pipe(&mut poll, pipe_fd)?;
 
@@ -161,6 +160,7 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
     RESIZE_OUT.get_or_init(|| resize_out);
     let mut resize_file = setup_resize(&mut poll, resize_in)?;
 
+    println!("Wye session {}, {pipe_path}", config.session_number);
     let res = event_loop(
         &mut poll,
         &mut stdin,
@@ -170,6 +170,7 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
     );
 
     std::fs::remove_file(pipe_path)?;
+    println!("Wye session {} closed", config.session_number);
 
     res
 }

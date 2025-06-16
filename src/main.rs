@@ -1,4 +1,4 @@
-use std::os::fd::AsRawFd;
+use std::{env, os::fd::AsRawFd};
 
 use nix::{
     pty::openpty,
@@ -6,12 +6,17 @@ use nix::{
     unistd::{ForkResult, close},
 };
 use wye::{
-    child, config, parent,
+    WYE_SESSION_VAR, child, config, parent,
     term::{TerminalModeGuard, get_winsize},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::parse_config()?;
+
+    if let Ok(session) = env::var(WYE_SESSION_VAR) {
+        println!("Wye already in session {session}");
+        return Ok(());
+    };
 
     let fd = std::io::stdin().as_raw_fd();
     let _guard = TerminalModeGuard::new(fd)?;

@@ -12,7 +12,7 @@ const PTY_TOKEN: Token = Token(1);
 const PIPE_TOKEN: Token = Token(2);
 const RESIZE_TOKEN: Token = Token(3);
 
-const WYE_SESSION_VAR: &str = "WYE";
+pub const WYE_SESSION_VAR: &str = "WYE";
 const WYE_PIPE_DIR: &str = "/tmp";
 const WYE_PIPE_PREFIX: &str = "wye";
 

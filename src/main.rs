@@ -12,6 +12,7 @@ use wye::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::parse_config()?;
+
     let fd = std::io::stdin().as_raw_fd();
     let _guard = TerminalModeGuard::new(fd)?;
 
@@ -28,11 +29,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match unsafe { nix::unistd::fork() } {
         Ok(ForkResult::Parent { .. }) => {
             close(pty.slave)?;
-            parent::process(&config, pty.master)
+            parent::process(config, pty.master)
         }
         Ok(ForkResult::Child) => {
             close(pty.master)?;
-            child::process(&config, pty.slave)
+            child::process(config, pty.slave)
         }
         Err(e) => {
             std::process::exit(e as i32);

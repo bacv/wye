@@ -17,3 +17,5 @@ const WYE_PIPE_DIR: &str = "/tmp";
 const WYE_PIPE_PREFIX: &str = "wye";
 
 static RESIZE_OUT: OnceLock<OwnedFd> = OnceLock::new();
+
+const FALLBACK_SHELL: &str = "/bin/sh";

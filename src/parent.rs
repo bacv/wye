@@ -146,7 +146,7 @@ fn event_loop(
     }
 }
 
-pub fn process(config: &Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     let mut poll = Poll::new()?;
 
     let mut master_file = setup_master(&mut poll, master_fd)?;

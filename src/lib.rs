@@ -1,5 +1,6 @@
 pub mod child;
 pub mod config;
+pub mod log;
 pub mod parent;
 pub mod term;
 

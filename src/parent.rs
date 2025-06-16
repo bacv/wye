@@ -17,6 +17,7 @@ use nix::{
 use crate::{
     PIPE_TOKEN, PTY_TOKEN, RESIZE_OUT, RESIZE_TOKEN, STDIN_TOKEN, WYE_PIPE_DIR, WYE_PIPE_PREFIX,
     config::Config,
+    log::{log_closed_session, log_opened_session},
     term::{get_winsize, update_pty_size},
 };
 
@@ -160,7 +161,7 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
     RESIZE_OUT.get_or_init(|| resize_out);
     let mut resize_file = setup_resize(&mut poll, resize_in)?;
 
-    println!("Wye session {}, {pipe_path}", config.session_number);
+    log_opened_session(config.session_number, &pipe_path)?;
     let res = event_loop(
         &mut poll,
         &mut stdin,
@@ -170,7 +171,7 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
     );
 
     std::fs::remove_file(pipe_path)?;
-    println!("Wye session {} closed", config.session_number);
+    log_closed_session(config.session_number)?;
 
     res
 }

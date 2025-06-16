@@ -6,7 +6,7 @@ use nix::{
     unistd::{ForkResult, close},
 };
 use wye::{
-    WYE_SESSION_VAR, child, config, parent,
+    WYE_SESSION_VAR, child, config, log, parent,
     term::{TerminalModeGuard, get_winsize},
 };
 
@@ -14,8 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::parse_config()?;
 
     if let Ok(session) = env::var(WYE_SESSION_VAR) {
-        println!("Wye already in session {session}");
-        return Ok(());
+        return log::log_already_in_session(session).map_err(Into::into);
     };
 
     let fd = std::io::stdin().as_raw_fd();

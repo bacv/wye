@@ -14,3 +14,4 @@ nix = { version = "0.30.1", features = ["fs", "ioctl", "process", "signal", "ter
 opt-level = "z"
 strip = true
 codegen-units = 1
+panic = "abort"

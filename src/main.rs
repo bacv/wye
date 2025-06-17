@@ -2,7 +2,7 @@ use std::{env, os::fd::AsRawFd};
 
 use nix::{
     pty::openpty,
-    sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr},
+    sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr},
     unistd::{ForkResult, close},
 };
 use wye::{
@@ -20,14 +20,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd = std::io::stdin().as_raw_fd();
     let _guard = TerminalModeGuard::new(fd)?;
 
-    let initial_winsize = get_winsize()?;
     let mut termios_settings = tcgetattr(std::io::stdin())?;
-
+    let initial_winsize = get_winsize()?;
     let pty = openpty(Some(&initial_winsize), Some(&termios_settings))?;
 
-    termios_settings
-        .local_flags
-        .remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG);
+    cfmakeraw(&mut termios_settings);
     tcsetattr(std::io::stdin(), SetArg::TCSANOW, &termios_settings)?;
 
     match unsafe { nix::unistd::fork() } {

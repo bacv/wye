@@ -117,7 +117,7 @@ fn event_loop(
                 master_file.write_all(&pipe_buf[..n])?;
             }
         }
-        if poll_fds[2].revents().contains(PollFlags::IN) {
+        if poll_fds[3].revents().contains(PollFlags::IN) {
             let mut drain_buf = [0; 1];
             _ = resize_file.read(&mut drain_buf);
 

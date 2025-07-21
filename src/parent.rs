@@ -24,6 +24,11 @@ use crate::{
     term::{get_winsize, update_pty_size},
 };
 
+const POLL_STDIN: usize = 0;
+const POLL_MASTER: usize = 1;
+const POLL_PIPE: usize = 2;
+const POLL_RESIZE: usize = 3;
+
 extern "C" fn handle_sigwinch(_: c_int) {
     if let Some(fd) = RESIZE_OUT.get() {
         let _ = nix::unistd::write(fd, &[0u8]);
@@ -68,6 +73,7 @@ fn event_loop(
     let poll_pipe = dup(pipe_file.as_fd())?;
     let poll_resize = dup(resize_file.as_fd())?;
 
+    // The sequence in the array needs to correspond to the POLL_* constant value later on.
     let mut poll_fds = [
         PollFd::new(&poll_stdin, PollFlags::IN),
         PollFd::new(&poll_master, PollFlags::IN),
@@ -87,7 +93,7 @@ fn event_loop(
             }
         }
 
-        if poll_fds[0].revents().contains(PollFlags::IN) {
+        if poll_fds[POLL_STDIN].revents().contains(PollFlags::IN) {
             let n = stdin.read(&mut stdin_buf)?;
             match n.cmp(&0) {
                 Ordering::Greater => {
@@ -102,7 +108,7 @@ fn event_loop(
             }
         }
 
-        if poll_fds[1].revents().contains(PollFlags::IN) {
+        if poll_fds[POLL_MASTER].revents().contains(PollFlags::IN) {
             let n = master_file.read(&mut pty_buf)?;
             if n > 0 {
                 stdout_lock.write_all(&pty_buf[..n])?;
@@ -111,13 +117,13 @@ fn event_loop(
                 return Ok(());
             }
         }
-        if poll_fds[2].revents().contains(PollFlags::IN) {
+        if poll_fds[POLL_PIPE].revents().contains(PollFlags::IN) {
             let n = pipe_file.read(&mut pipe_buf)?;
             if n > 0 {
                 master_file.write_all(&pipe_buf[..n])?;
             }
         }
-        if poll_fds[3].revents().contains(PollFlags::IN) {
+        if poll_fds[POLL_RESIZE].revents().contains(PollFlags::IN) {
             let mut drain_buf = [0; 1];
             _ = resize_file.read(&mut drain_buf);
 

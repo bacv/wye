@@ -18,7 +18,7 @@ use rustix::{
 };
 
 use crate::{
-    RESIZE_OUT, WYE_PIPE_DIR, WYE_PIPE_PREFIX,
+    RESIZE_OUT, StdoutProcessor, WYE_PIPE_DIR, WYE_PIPE_PREFIX,
     config::Config,
     log::{log_closed_session, log_opened_session},
     term::{get_winsize, update_pty_size},
@@ -60,9 +60,11 @@ fn event_loop(
     master_file: &mut File,
     pipe_file: &mut File,
     resize_file: &mut File,
+    stdout_processor: &mut StdoutProcessor,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin_buf = [0u8; 1024];
     let mut pty_buf = [0u8; 1024];
+    let mut pty2_buf = [0u8; 1024];
     let mut pipe_buf = [0u8; 1024];
 
     let stdout = io::stdout();
@@ -111,7 +113,8 @@ fn event_loop(
         if poll_fds[POLL_MASTER].revents().contains(PollFlags::IN) {
             let n = master_file.read(&mut pty_buf)?;
             if n > 0 {
-                stdout_lock.write_all(&pty_buf[..n])?;
+                let bytes_written = stdout_processor.process(&pty_buf[..n], &mut pty2_buf);
+                stdout_lock.write_all(&pty2_buf[..bytes_written])?;
                 stdout_lock.flush()?;
             } else {
                 return Ok(());
@@ -145,6 +148,7 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
     RESIZE_OUT.get_or_init(|| resize_out);
     setup_resize(&resize_in)?;
     let mut resize_file = File::from(resize_in);
+    let mut stdout_processor = StdoutProcessor::new();
 
     log_opened_session(config.session_number, &pipe_path)?;
     let res = event_loop(
@@ -152,6 +156,7 @@ pub fn process(config: Config, master_fd: OwnedFd) -> Result<(), Box<dyn std::er
         &mut master_file,
         &mut pipe_file,
         &mut resize_file,
+        &mut stdout_processor,
     );
 
     std::fs::remove_file(pipe_path)?;
